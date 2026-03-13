@@ -1,0 +1,10 @@
+flask
+flask-cors
+tensorflow
+numpy
+tf-keras-vis
+matplotlib
+cv2
+openai
+dotenv
+scikit-learn
