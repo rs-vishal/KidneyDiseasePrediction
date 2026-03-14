@@ -120,80 +120,137 @@ def gradcam_api():
 # ----------------- Fusion API -----------------
 @app.route('/fusion', methods=['POST'])
 def fusion_api():
+
     if 'file' not in request.files:
         return jsonify({"error": "No file provided"}), 400
 
     file = request.files['file']
-    
-    # Get clinical parameters
+
     try:
+        # -------- Clinical Parameters --------
         age = float(request.form.get('age', 0))
         bp = float(request.form.get('bp', 0))
         creatinine = float(request.form.get('creatinine', 0))
         egfr = float(request.form.get('egfr', 0))
         urea = float(request.form.get('urea', 0))
-        clinical_features = np.array([[age, bp, creatinine, egfr, urea]])
-    except Exception as e:
-        return jsonify({"error": f"Invalid clinical parameters: {e}"}), 400
 
-    # Image Prediction
-    img_array, original_img = preprocess_image(file, use_resnet=True) # Resnet true for gradcam
-    img_array_custom, _ = preprocess_image(file, use_resnet=False)
-    
-    img_pred = custom_model.predict(img_array_custom)[0]
-    
-    # Clinical Prediction
-    if clinical_model:
-        clin_pred = clinical_model.predict(clinical_features)[0]
-        # Late fusion (average probabilities)
-        final_pred = (img_pred + clin_pred) / 2.0
-    else:
-        # Fallback if clinical model fails to load
+        # Model expects 24 features → pad remaining with zeros
+        clinical_features = np.array(
+            [[age, bp, creatinine, egfr, urea] + [0]*19],
+            dtype=np.float32
+        )
+
+    except Exception as e:
+        return jsonify({"error": f"Invalid clinical parameters: {str(e)}"}), 400
+
+
+    # -------- Image Prediction --------
+    try:
+
+        img_array, original_img = preprocess_image(file, use_resnet=True)
+        img_array_custom, _ = preprocess_image(file, use_resnet=False)
+
+        img_pred = custom_model.predict(img_array_custom)[0]
+
+    except Exception as e:
+        return jsonify({"error": f"Image processing failed: {str(e)}"}), 500
+
+
+    # -------- Clinical Prediction --------
+    try:
+
+        if clinical_model is not None:
+
+            clin_pred = clinical_model.predict(clinical_features)[0]
+
+            # Late Fusion (average probabilities)
+            final_pred = (img_pred + clin_pred) / 2.0
+
+        else:
+            final_pred = img_pred
+
+    except Exception as e:
+
+        print("Clinical model error:", e)
         final_pred = img_pred
 
-    # Determine class index from combined prediction
+
+    # -------- Final Class Prediction --------
     predicted_class_idx = int(np.argmax(final_pred))
-    
-    # User's specified mapping: 1 is cyst, 2 normal, 3 stone, 4 tumor
-    # Let's map it based on the name from CLASS_LABELS, which is ["Normal", "Cyst", "Stone", "Tumor"]
+
+    CLASS_LABELS = ["Normal", "Cyst", "Stone", "Tumor"]
+
     class_name_base = CLASS_LABELS[predicted_class_idx]
-    
-    # Ensure exact mapping requested by user for the result label
+
+
     user_labels = {
         "Cyst": "cyst (label 1)",
         "Normal": "normal (label 2)",
         "Stone": "stone (label 3)",
-        "Tumor": "tumor (label 4)",
+        "Tumor": "tumor (label 4)"
     }
+
     final_classification = user_labels.get(class_name_base, class_name_base)
 
-    # ---------------- Grad-CAM Generation ----------------
-    original_img = original_img.astype(np.uint8)
-    resnet_prediction = resnet_model.predict(img_array)
-    resnet_class_idx = np.argmax(resnet_prediction[0])
 
-    def score(output):
-        return output[:, resnet_class_idx]
+    # -------- GradCAM Generation --------
+    try:
 
-    gradcam = Gradcam(resnet_model, clone=True)
-    cam = gradcam(score, img_array, penultimate_layer=resnet_model.get_layer("conv5_block3_out"))
+        original_img = original_img.astype(np.uint8)
 
-    heatmap = cam[0]
-    heatmap = cv2.resize(heatmap, (original_img.shape[1], original_img.shape[0]))
-    heatmap = np.uint8(255 * heatmap)
-    heatmap = cv2.applyColorMap(heatmap, cv2.COLORMAP_JET)
+        resnet_prediction = resnet_model.predict(img_array)
+        resnet_class_idx = np.argmax(resnet_prediction[0])
 
-    overlay = cv2.addWeighted(original_img, 0.6, heatmap, 0.4, 0)
-    gradcam_base64 = encode_image_to_base64(overlay)
+        def score(output):
+            return output[:, resnet_class_idx]
 
+        gradcam = Gradcam(resnet_model, clone=True)
+
+        cam = gradcam(
+            score,
+            img_array,
+            penultimate_layer=resnet_model.get_layer("conv5_block3_out")
+        )
+
+        heatmap = cam[0]
+
+        heatmap = cv2.resize(
+            heatmap,
+            (original_img.shape[1], original_img.shape[0])
+        )
+
+        heatmap = np.uint8(255 * heatmap)
+
+        heatmap = cv2.applyColorMap(
+            heatmap,
+            cv2.COLORMAP_JET
+        )
+
+        overlay = cv2.addWeighted(
+            original_img,
+            0.6,
+            heatmap,
+            0.4,
+            0
+        )
+
+        gradcam_base64 = encode_image_to_base64(overlay)
+
+    except Exception as e:
+
+        print("GradCAM error:", e)
+        gradcam_base64 = None
+
+
+    # -------- Response --------
     response = {
         "prediction": final_pred.tolist(),
-        "predicted_class": predicted_class_idx, # internal index
+        "predicted_class": predicted_class_idx,
         "classification": final_classification,
         "gradcam": gradcam_base64
     }
-    return jsonify(response)
 
+    return jsonify(response)
 openai.api_key = os.getenv("GROQ_API_KEY")
 openai.base_url = "https://api.groq.com/openai/v1/"  # correct base_url
 
